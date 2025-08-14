@@ -272,9 +272,9 @@ class LLMDataDistCMgrConnectorScheduler():
         # note: there might be some issue on this, check it if there is any unexpected result
         computed_block_ids = block_ids
         delay_free_blocks = len(computed_block_ids) > 0
-        if delay_free_blocks:
-            logger.info("Delaying free of %d blocks for request %s",
-                        len(computed_block_ids), request.request_id)
+        # if delay_free_blocks:
+        #     logger.info("Delaying free of %d blocks for request %s",
+        #                 len(computed_block_ids), request.request_id)
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,
@@ -294,7 +294,7 @@ class LLMDataDistCMgrConnectorWorker():
 
     def __init__(self, vllm_config: VllmConfig):
         assert vllm_config.kv_transfer_config is not None
-        logger.info("Initialize the LLMDataDistCMgrConnectorWorker")
+        # logger.info("Initialize the LLMDataDistCMgrConnectorWorker")
         # we assume the local node only contains dp and tp, and tp will not communicate inter-node.
         # for any scenario beyond this scope, the functionality of this connector is not guaranteed.
         self.local_rank_on_node = get_world_group().rank % (
@@ -352,9 +352,9 @@ class LLMDataDistCMgrConnectorWorker():
         logger.debug(f"Start to listen to address: {url}")
         logger.debug(
             f"The local agent metadata have {len(msg_to_send)} bytes here")
-        logger.info(
-            f"LLMDataDistCMgrConnectorWorker: Cluster {self.local_agent_metadata.cluster_id} start to listen request from peers"
-        )
+        # logger.info(
+        #     f"LLMDataDistCMgrConnectorWorker: Cluster {self.local_agent_metadata.cluster_id} start to listen request from peers"
+        # )
         with zmq_ctx(zmq.ROUTER, url) as sock:  # type: ignore[attr-defined]
             event.set()
             while True:
@@ -364,9 +364,9 @@ class LLMDataDistCMgrConnectorWorker():
                 if event_msg == LLMDataDistCMgrEvent.ReqForMetadata:
                     if "cluster_id" in decode_msg:
                         decode_msg = LLMDataDistCMgrAgentMetadata(**decode_msg)
-                        logger.info(
-                            f"LLMDataDistCMgrConnectorWorker: Receive message from cluster {decode_msg.cluster_id}"
-                        )
+                        # logger.info(
+                        #     f"LLMDataDistCMgrConnectorWorker: Receive message from cluster {decode_msg.cluster_id}"
+                        # )
                         sock.send_multipart((identity, b"", msg_to_send))
                         self.add_remote_agent(decode_msg)
                     else:
@@ -404,9 +404,9 @@ class LLMDataDistCMgrConnectorWorker():
         self.done_receiving_counts[request_id].add(tp_rank)
         if len(self.done_receiving_counts[request_id]) == decode_tp_size:
             self.done_receiving_counts.pop(request_id)
-            logger.info("All transfers completed for request: "
-                        f"{request_id}. Total ranks: "
-                        f"{decode_tp_size}.")
+            # logger.info("All transfers completed for request: "
+            #             f"{request_id}. Total ranks: "
+            #             f"{decode_tp_size}.")
             return True
         return False
 
@@ -421,9 +421,9 @@ class LLMDataDistCMgrConnectorWorker():
         llm_config_options = llm_config.generate_options()
         self.llm_datadist.init(llm_config_options)
         self.cache_manager = self.llm_datadist.cache_manager
-        logger.info(
-            f"Done initialize llm_datadist in rank {self.rank}, local rank {self.local_rank}, cluster id {self.local_agent_metadata.cluster_id}"
-        )
+        # logger.info(
+        #     f"Done initialize llm_datadist in rank {self.rank}, local rank {self.local_rank}, cluster id {self.local_agent_metadata.cluster_id}"
+        # )
 
     def read_offline_rank_table(self):
         assert (
@@ -544,7 +544,7 @@ class LLMDataDistCMgrConnectorWorker():
                 cache_k_pe = self.cache_manager.register_blocks_cache(
                     self.cache_desc[1], self.cache_addr[1], self.cache_key[1])
                 self.cache = (cache_k_normed, cache_k_pe)
-                logger.info("LLMDataDistWorker: End of register Paged Cache.")
+                # logger.info("LLMDataDistWorker: End of register Paged Cache.")
             except (TypeError, ValueError):
                 raise RuntimeError(
                     f"LLMDataDistCMgrConnectorWorker: Passing unexpected parameter to register_block_cache, receiving [cache_desc: {self.cache_desc}, cache_addr: {self.cache_addr}, cache_key: {self.cache_key}]"
@@ -561,15 +561,15 @@ class LLMDataDistCMgrConnectorWorker():
                 TORCH_DTYPE_TO_NPU_DTYPE[kv_cache_dtype])
             self.cache_key = BlocksCacheKey(
                 cluster_id=int(self.local_agent_metadata.cluster_id))
-            logger.info(
-                f"num of cache: {len(self.cache_addr)}, size of cache: {[*cache.shape]}, real size of cache: {first_kv_cache.shape}"
-            )
+            # logger.info(
+            #     f"num of cache: {len(self.cache_addr)}, size of cache: {[*cache.shape]}, real size of cache: {first_kv_cache.shape}"
+            # )
             try:
                 self.cache = self.cache_manager.register_blocks_cache(
                     self.cache_desc, self.cache_addr, self.cache_key)
-                logger.info(
-                    "LLMDataDistCMgrConnectorWorker: End of register Paged Cache."
-                )
+                # logger.info(
+                #     "LLMDataDistCMgrConnectorWorker: End of register Paged Cache."
+                # )
             except (TypeError, ValueError):
                 raise RuntimeError(
                     f"LLMDataDistCMgrConnectorWorker: Passing unexpected parameter to register_block_cache, receiving [cache_desc: {self.cache_desc}, cache_addr: {self.cache_addr}, cache_key: {self.cache_key}]"
@@ -705,32 +705,32 @@ class LLMDataDistCMgrConnectorWorker():
                 super_pod_list.append(decode_super_pod_id)
             rank_table[
                 "super_pod_list"] = super_pod_list  # type: ignore[assignment]
-        logger.info(
-            f"LLMDataDistCMgrConnectorWorker: try link with remote, comm id: {comm_name}"
-        )
-        logger.info(f"rank table \n{rank_table}")
-        logger.info(f"comm name: {comm_name}")
-        logger.info(f"cluster rank info: {cluster_rank_info}")
+        # logger.info(
+        #     f"LLMDataDistCMgrConnectorWorker: try link with remote, comm id: {comm_name}"
+        # )
+        # logger.info(f"rank table \n{rank_table}")
+        # logger.info(f"comm name: {comm_name}")
+        # logger.info(f"cluster rank info: {cluster_rank_info}")
         comm_id = self.llm_datadist.link(comm_name, cluster_rank_info,
                                          json.dumps(rank_table))
         while True:
             ret = self.llm_datadist.query_register_mem_status(comm_id=comm_id)
             if ret == llm_datadist.RegisterMemStatus.OK:
-                logger.info(
-                    f"LLMDataDistCMgrConnectorWorker: Linking success, comm id: {comm_id}"
-                )
+                # logger.info(
+                #     f"LLMDataDistCMgrConnectorWorker: Linking success, comm id: {comm_id}"
+                # )
                 break
             elif ret == llm_datadist.RegisterMemStatus.FAILED:
                 raise RuntimeError(
                     f"LLMDataDistCMgrConnectorWorker: Linking failed, comm id: {comm_id}"
                 )
             time.sleep(1)
-            logger.info("Checking query_register_mem_status again")
+            # logger.info("Checking query_register_mem_status again")
         self.linked_cluster.update({remote_cluster_id: comm_id})
-        logger.info(f"cached linked cluster: {self.linked_cluster}")
-        logger.info(
-            f"Successfully build link with cluster id {remote_cluster_id} with cluster name {comm_name} !"
-        )
+        # logger.info(f"cached linked cluster: {self.linked_cluster}")
+        # logger.info(
+        #     f"Successfully build link with cluster id {remote_cluster_id} with cluster name {comm_name} !"
+        # )
         return remote_cluster_id
 
     def remove_remote_agent(self, cluster_id: int):
@@ -746,9 +746,9 @@ class LLMDataDistCMgrConnectorWorker():
             logger.error(
                 f"Try to remove remote client with cluster id {cluster_id} failed!, program won't terminate, but please carefully check your environment"
             )
-        logger.info(
-            f"Successfully remove remote client with cluster id {cluster_id} !"
-        )
+        # logger.info(
+        #     f"Successfully remove remote client with cluster id {cluster_id} !"
+        # )
 
     def connect_to_remote_agent(self, host: str, port: int) -> int:
         url = f"tcp://{host}:{port}"
@@ -757,13 +757,13 @@ class LLMDataDistCMgrConnectorWorker():
         msg_send = msg_encoder.encode(
             [LLMDataDistCMgrEvent.ReqForMetadata, self.local_agent_metadata])
         with zmq_ctx(zmq.REQ, url) as sock:  # type: ignore[attr-defined]
-            logger.info("Try request remote metadata from socket......")
+            # logger.info("Try request remote metadata from socket......")
             sock.send(msg_send)
             metadata_bytes = sock.recv()
             decoder = msgspec.msgpack.Decoder()
             metadata = decoder.decode(metadata_bytes)
             metadata = LLMDataDistCMgrAgentMetadata(**metadata)
-            logger.info(f"recving metadata: {metadata}")
+            # logger.info(f"recving metadata: {metadata}")
             cluster_id = self.add_remote_agent(metadata)
         return cluster_id
 
@@ -808,13 +808,13 @@ class LLMDataDistCMgrConnectorWorker():
         if num_local_blocks < num_remote_blocks:
             remote_block_ids = remote_block_ids[-num_local_blocks:]
 
-        logger.info(f"remote cluster id is: {remote_cluster_id}")
+        # logger.info(f"remote cluster id is: {remote_cluster_id}")
         if self.use_mla:
             remote_cache_key_k_normed = BlocksCacheKey(
                 cluster_id=remote_cluster_id, model_id=0)
             remote_cache_key_k_pe = BlocksCacheKey(
                 cluster_id=remote_cluster_id, model_id=1)
-            logger.info("Try pull blocks from remote server")
+            # logger.info("Try pull blocks from remote server")
             try:
                 self.cache_manager.pull_blocks(
                     remote_cache_key_k_normed,
@@ -836,7 +836,7 @@ class LLMDataDistCMgrConnectorWorker():
                 )
         else:
             remote_cache_key = BlocksCacheKey(cluster_id=remote_cluster_id)
-            logger.info("Try pull blocks from remote server")
+            # logger.info("Try pull blocks from remote server")
             try:
                 self.cache_manager.pull_blocks(
                     remote_cache_key,

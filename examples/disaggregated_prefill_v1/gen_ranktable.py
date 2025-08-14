@@ -17,10 +17,33 @@ parser.add_argument("--decode-device-cnt",
                     type=int,
                     required=True,
                     help="number of decode devices")
+parser.add_argument("--prefill-device-ids",
+                    type=str,
+                    help="comma-separated list of prefill device IDs (e.g., '0,1')")
+parser.add_argument("--decode-device-ids",
+                    type=str,
+                    help="comma-separated list of decode device IDs (e.g., '4,5')")
 args = parser.parse_args()
 local_host = args.local_host
 prefill_device_cnt = args.prefill_device_cnt
 decode_device_cnt = args.decode_device_cnt
+prefill_device_ids = args.prefill_device_ids
+decode_device_ids = args.decode_device_ids
+
+# Parse device IDs if provided
+if prefill_device_ids:
+    prefill_device_ids = [int(x.strip()) for x in prefill_device_ids.split(',')]
+    if len(prefill_device_ids) != prefill_device_cnt:
+        raise ValueError(f"Number of prefill device IDs ({len(prefill_device_ids)}) must match prefill_device_cnt ({prefill_device_cnt})")
+else:
+    prefill_device_ids = None
+
+if decode_device_ids:
+    decode_device_ids = [int(x.strip()) for x in decode_device_ids.split(',')]
+    if len(decode_device_ids) != decode_device_cnt:
+        raise ValueError(f"Number of decode device IDs ({len(decode_device_ids)}) must match decode_device_cnt ({decode_device_cnt})")
+else:
+    decode_device_ids = None
 
 print("enter py")
 
@@ -101,16 +124,57 @@ for device_info in global_device_list:  # type: ignore[assignment]
     cnt += 1
 assert (prefill_device_cnt + decode_device_cnt) <= len(global_device_list), \
 "prefill_device_cnt + decode_device_cnt must be less than or equal to number of all devices in cluster"
+
+# Select devices based on specified IDs or default sequential allocation
+if prefill_device_ids is not None:
+    # Find devices by specified IDs
+    prefill_devices = []
+    for device_id in prefill_device_ids:
+        device_found = False
+        for device_info in global_device_list:
+            if int(device_info["device_id"]) == device_id and device_info["server_id"] == local_host:
+                prefill_devices.append(device_info)
+                device_found = True
+                break
+        if not device_found:
+            raise ValueError(f"Prefill device ID {device_id} not found in global device list for server {local_host}")
+else:
+    # Default sequential allocation
+    prefill_devices = global_device_list[:prefill_device_cnt]
+
+if decode_device_ids is not None:
+    # Find devices by specified IDs
+    decode_devices = []
+    for device_id in decode_device_ids:
+        device_found = False
+        for device_info in global_device_list:
+            if int(device_info["device_id"]) == device_id and device_info["server_id"] == local_host:
+                decode_devices.append(device_info)
+                device_found = True
+                break
+        if not device_found:
+            raise ValueError(f"Decode device ID {device_id} not found in global device list for server {local_host}")
+else:
+    # Default sequential allocation
+    decode_devices = global_device_list[prefill_device_cnt:prefill_device_cnt + decode_device_cnt]
+
+# Add rank_id to prefill devices (starting from 0)
+for rank_id, device_info in enumerate(prefill_devices):
+    device_info["rank_id"] = rank_id
+
+# Add rank_id to decode devices (starting from 0)
+for rank_id, device_info in enumerate(decode_devices):
+    device_info["rank_id"] = rank_id
+
 ranktable = {
     "version":
     "1.2",
     "server_count":
     str(world_size),
     "prefill_device_list":
-    global_device_list[:prefill_device_cnt],
+    prefill_devices,
     "decode_device_list":
-    global_device_list[prefill_device_cnt:prefill_device_cnt +
-                       decode_device_cnt],
+    decode_devices,
     "status":
     "completed"
 }

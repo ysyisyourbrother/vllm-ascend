@@ -202,6 +202,9 @@ class AscendScheduler(Scheduler):
                 request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
                 continue
 
+            # 【节点6】请求被加入running队列
+            logger.info(f"【{request.request_id}，请求被加入running队列】")
+
             self.running.append(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.SCHEDULED,
