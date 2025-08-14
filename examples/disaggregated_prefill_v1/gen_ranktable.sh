@@ -33,6 +33,16 @@ while [[ $# -gt 0 ]]; do
             DECODE_DEVICE_CNT="$1"
             shift
             ;;
+        --prefill-device-ids)
+            shift
+            PREFILL_DEVICE_IDS="$1"
+            shift
+            ;;
+        --decode-device-ids)
+            shift
+            DECODE_DEVICE_IDS="$1"
+            shift
+            ;;
     esac
 done
 LOCAL_HOSTS=($(hostname -I))
@@ -69,11 +79,22 @@ echo "NODE_RANK": $NODE_RANK
 echo "==============="
 
 if [[ -n "${GEN_RANKTABLE}" || ! -e ${PWD}/ranktable.json ]]; then
+    # Build the command with optional device ID parameters
+    CMD_ARGS="--local-host $LOCAL_HOST --prefill-device-cnt $PREFILL_DEVICE_CNT --decode-device-cnt $DECODE_DEVICE_CNT"
+
+    if [[ -n "$PREFILL_DEVICE_IDS" ]]; then
+        CMD_ARGS="$CMD_ARGS --prefill-device-ids $PREFILL_DEVICE_IDS"
+    fi
+
+    if [[ -n "$DECODE_DEVICE_IDS" ]]; then
+        CMD_ARGS="$CMD_ARGS --decode-device-ids $DECODE_DEVICE_IDS"
+    fi
+
     GLOO_SOCKET_IFNAME=$NETWORK_CARD_NAME torchrun \
         --nproc_per_node 1 \
         --nnodes ${NNODES} \
         --node_rank ${NODE_RANK} \
         --master_addr ${MASTER_ADDR} \
         --master_port ${MASTER_PORT} \
-        gen_ranktable.py --local-host $LOCAL_HOST --prefill-device-cnt $PREFILL_DEVICE_CNT --decode-device-cnt $DECODE_DEVICE_CNT
+        gen_ranktable.py $CMD_ARGS
 fi
