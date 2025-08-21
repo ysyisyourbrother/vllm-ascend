@@ -27,8 +27,15 @@
 
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
+import os
 import torch
 import torch_npu
+from vllm.logger import init_logger
+
+# 添加模块加载日志
+logger = init_logger("vllm")
+if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+    logger.info("【推理路径定位】DeepSeek V2/V3 模型文件已加载 - vllm_ascend.models.deepseek_v2")
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
@@ -298,9 +305,14 @@ class CustomDeepseekV2MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+
+        # 记录并行配置信息
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】MoE模型配置 - TP size: {self.tp_size}, 路由专家数: {config.n_routed_experts}, 共享专家数: {config.n_shared_experts}, Top-K: {config.num_experts_per_tok}")
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -356,8 +368,12 @@ class CustomDeepseekV2MoE(nn.Module):
                 force_replicate=self.enable_multistream_moe,
                 prefix=f"{prefix}.shared_experts",
             )
+            # 共享专家创建完成后打印日志
+            logger.info(f"【推理路径定位】共享专家创建完成 - 共享专家数量: {config.n_shared_experts}, "
+                       f"中间层大小: {intermediate_size}")
         else:
             self.shared_experts = None  # type: ignore
+            logger.info(f"【推理路径定位】当前模型无共享专家配置")
         CustomDeepseekV2MoE.top_k = config.num_experts_per_tok
 
         self.dp_size = get_dp_group().world_size
@@ -365,6 +381,13 @@ class CustomDeepseekV2MoE(nn.Module):
         self.tp_group = get_tp_group().device_group
         self.tp_rank = get_tp_group().rank_in_group
         self.ep_group = get_ep_group()
+
+        # 检查专家并行是否启用
+        from vllm.config import get_current_vllm_config
+        current_config = get_current_vllm_config()
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】专家并行检查 - enable_expert_parallel: {current_config.parallel_config.enable_expert_parallel}")
+
         self.kv_consumer = None
         transfer_config = get_current_vllm_config().kv_transfer_config
         if transfer_config is not None:
@@ -457,6 +480,9 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
 
         self.prefix = prefix
         self.debug_layer_idx = int(self.prefix.split(".")[-2])
+
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】Attention Layer {self.debug_layer_idx} 初始化 - num_heads: {num_heads}, head_dim: {self.qk_head_dim}")
 
         ascend_config = get_ascend_config()
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
@@ -567,6 +593,9 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             hidden_states: torch.Tensor,
             kv_cache: Optional[torch.Tensor] = None,
             attn_metadata: Optional[AttentionMetadata] = None) -> torch.Tensor:
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】Attention Layer {self.debug_layer_idx} forward开始 - hidden_states shape: {hidden_states.shape}")
+        
         forward_context = get_forward_context()
         enable_multistream_mla = (self.enable_multistream_mla
                                   and attn_metadata is not None
@@ -599,11 +628,13 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
             kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
-            return self.mla_attn(hidden_states_or_q_c,
+            output = self.mla_attn(hidden_states_or_q_c,
                                  kv_c_normed,
                                  k_pe,
                                  output_shape=hidden_states.shape)
-
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】Attention Layer {self.debug_layer_idx} forward完成 (torchair_graph_enabled = False) - output shape: {output.shape}")
+            return output
 
 class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
 
@@ -687,6 +718,10 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         attn_metadata: Optional[AttentionMetadata] = None,
         replace_allreduce: bool = False,
     ) -> torch.Tensor:
+        # 添加DecoderLayer forward开始日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】CustomDeepseekV2DecoderLayer[{self.layer_idx}] forward开始 - hidden_states shape: {hidden_states.shape}")
+
         # Self Attention
         if attn_metadata is not None and attn_metadata.num_decodes > 0:
             mla_moe_communication = self.mla_moe_communication and replace_allreduce
@@ -735,11 +770,18 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
 
+        # 添加attention block完成后进入专家层的日志
         if isinstance(self.mlp, CustomDeepseekV2MoE):
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】Decoder Layer {self.layer_idx} - 检测到MoE层，开始专家层处理, 输入大小 {hidden_states.shape}")
             hidden_states = self.mlp(hidden_states,
                                      attn_metadata,
                                      replace_allreduce=mla_moe_communication)
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】Decoder Layer {self.layer_idx} - MoE层处理完成")
         else:
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】Decoder Layer {self.layer_idx} - 使用标准MLP层（非MoE）")
             hidden_states = self.mlp(hidden_states)
 
         if isinstance(
@@ -755,6 +797,10 @@ class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
             hidden_states = tensor_model_parallel_all_gather(hidden_states,
                                                              dim=0)
             residual = tensor_model_parallel_all_gather(residual, dim=0)
+
+        # 添加DecoderLayer forward完成日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】CustomDeepseekV2DecoderLayer[{self.layer_idx}] forward完成 - output shape: {hidden_states.shape}")
 
         return hidden_states, residual
 
@@ -815,6 +861,10 @@ class CustomDeepseekV2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        # 添加模型forward开始日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】CustomDeepseekV2Model forward开始 - input_ids shape: {input_ids.shape if input_ids is not None else 'None'}")
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -859,6 +909,7 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
+
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
@@ -984,7 +1035,16 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        # 添加主模型forward开始日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】CustomDeepseekV2ForCausalLM forward开始 - input_ids shape: {input_ids.shape if input_ids is not None else 'None'}")
+
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, intermediate_tensors,
                                    inputs_embeds)
+
+        # 添加主模型forward完成日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】CustomDeepseekV2ForCausalLM forward完成 - hidden_states shape: {hidden_states.shape if hasattr(hidden_states, 'shape') else 'IntermediateTensors'}")
+
         return hidden_states

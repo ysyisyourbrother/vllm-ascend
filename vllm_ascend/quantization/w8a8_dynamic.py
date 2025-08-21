@@ -17,11 +17,13 @@
 
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
+import os
 import torch
 import torch.distributed as dist
 import torch_npu
 from vllm.distributed import GroupCoordinator, get_ep_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 
 import vllm_ascend.envs as envs
 from vllm_ascend.ascend_config import get_ascend_config
@@ -32,6 +34,8 @@ from vllm_ascend.torchair.utils import npu_stream_switch, npu_wait_tensor
 from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_NZ, AscendSocVersion,
                                dispose_tensor, get_ascend_soc_version)
 
+# 初始化logger
+logger = init_logger("vllm")
 
 def apply_mlp_decode(hidden_states: torch.Tensor,
                      w1: torch.Tensor,
@@ -222,6 +226,10 @@ def fused_experts_with_mc2(
     w1_scale_bias: torch.Tensor = None,
     w2_scale_bias: torch.Tensor = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    # 添加W8A8 MC2函数开始日志
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】W8A8 fused_experts_with_mc2开始 - 输入维度: {hidden_states.shape}, top_k: {top_k}")
+
     assert mc2_mask is not None
     if log2phy is not None:
         topk_ids = log2phy[topk_ids]
@@ -230,6 +238,10 @@ def fused_experts_with_mc2(
     ep_group = get_mc2_group()
     ep_rank_id = ep_group.rank_in_group
     ep_world_size = ep_group.world_size
+
+    # 记录EP配置
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】W8A8 MC2配置 - EP rank: {ep_rank_id}, EP world_size: {ep_world_size}")
 
     # NOTE: Currently, when in A3 or in torchair graph, we need to pass in some extra param into dispatch & combine
     need_extra_args = (get_ascend_soc_version() == AscendSocVersion.A3
@@ -273,6 +285,10 @@ def fused_experts_with_mc2(
         })
     kwargs_mc2.update(stage1_kwargs)
 
+    # 添加W8A8 MC2 Token Dispatch日志
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】W8A8 MC2开始Token Dispatch - EP rank {ep_rank_id}, 使用dispatch_v2: {enable_dispatch_v2}")
+
     output = torch_npu.npu_moe_distribute_dispatch_v2(
         **kwargs_mc2
     ) if enable_dispatch_v2 else torch_npu.npu_moe_distribute_dispatch(
@@ -280,6 +296,10 @@ def fused_experts_with_mc2(
     # comm_stream.wait_stream(torch.npu.current_stream())
     expand_x, dynamic_scale, assist_info_for_combine, expert_token_nums, ep_recv_counts = output[
         0:5]
+
+    # 添加dispatch完成日志
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】W8A8 MC2完成Token Dispatch - EP rank {ep_rank_id}, 分发后tokens: {expand_x.shape[0]}")
 
     if shared_experts is not None:
         with npu_stream_switch("moe_secondary", 0):
@@ -350,18 +370,29 @@ def fused_experts_with_mc2(
         })
     kwargs_mc2.update(stage3_kwargs)
 
+    # 添加W8A8 MC2 Token Combine日志
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】W8A8 MC2开始Token Combine - EP rank {ep_rank_id}")
+
     hidden_states = torch_npu.npu_moe_distribute_combine_v2(
         **kwargs_mc2
     ) if enable_dispatch_v2 else torch_npu.npu_moe_distribute_combine(
         **kwargs_mc2)
 
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】W8A8 MC2完成Token Combine - EP rank {ep_rank_id}, 合并后维度: {hidden_states.shape}")
+
     if shared_experts is None:
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】W8A8 fused_experts_with_mc2完成 - 仅路由专家")
         return hidden_states
     else:
         with npu_stream_switch("moe_secondary", 0):
             npu_wait_tensor(shared_act, down_out_list)
             shared_output, _ = shared_experts.down_proj(
                 (shared_act, swiglu_out_scale))
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】W8A8 fused_experts_with_mc2完成 - 路由专家+共享专家")
         return hidden_states, shared_output
 
 
@@ -406,6 +437,7 @@ def fused_experts_with_all2all(
     w1_scale_bias: torch.Tensor = None,
     w2_scale_bias: torch.Tensor = None,
 ):
+    
     if log2phy is not None:
         topk_ids = log2phy[topk_ids]
     original_shape = hidden_states.shape
@@ -414,6 +446,12 @@ def fused_experts_with_all2all(
 
     num_tokens, _ = hidden_states.shape
     num_experts = w1.shape[0]
+
+    ep_rank_id = ep_group.rank_in_group
+    ep_world_size = ep_group.world_size
+    # 添加W8A8 All2All函数开始日志 记录EP配置
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】W8A8 fused_experts_with_all2all开始 - 输入维度: {hidden_states.shape}, top_k: {top_k}, EP rank: {ep_rank_id}, EP world_size: {ep_world_size}")
 
     if expert_map is not None:
         global_num_experts = len(expert_map) + global_redundant_expert_num
@@ -432,6 +470,10 @@ def fused_experts_with_all2all(
         else:
             quantized_tokens, expanded_row_idx, global_expert_tokens, token_scales = init_routing_quant(
                 hidden_states, top_k, topk_ids, global_num_experts)
+
+        # 添加W8A8 All2All Token Dispatch开始日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】W8A8 All2All EP rank {ep_rank_id} 开始Token Dispatch")
 
         gather_sizes = global_expert_tokens.new_empty(
             global_expert_tokens.shape[0])
@@ -455,6 +497,11 @@ def fused_experts_with_all2all(
                                scatter_size_list, gather_size_list)
         dist.all_to_all_single(dynamic_scale, token_scales, scatter_size_list,
                                gather_size_list)
+
+        # 构建分发token数量的字典并打印分发日志
+        dispatch_info = {f"rank{i}": scatter_size_list[i] for i in range(ep_group.world_size)}
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】W8A8 All2All完成Token Dispatch - EP rank {ep_rank_id} 分发token数量: {dispatch_info}")
 
         hidden_states, dynamic_scale, inverse_indices, expert_tokens = torch_npu.npu_moe_re_routing(
             gathered_tokens,
@@ -501,6 +548,10 @@ def fused_experts_with_all2all(
             # Workaround: Convert to float so that argsort runs on AI Core instead of slower AICPU
             index=inverse_indices.to(torch.float32).argsort().to(torch.int32))
 
+        # 添加W8A8 All2All Token Combine开始日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】W8A8 All2All EP rank {ep_rank_id} 开始Token Combine")
+
         hidden_states = reordered_outputs.new_empty(*quantized_tokens.shape)
         dist.all_to_all_single(hidden_states, reordered_outputs,
                                gather_size_list, scatter_size_list)
@@ -514,6 +565,11 @@ def fused_experts_with_all2all(
             expanded_src_to_dst_row=expanded_row_idx,
             export_for_source_row=None,
             drop_pad_mode=2)
+
+        # 构建combine token数量的字典并打印日志
+        combine_info = {f"rank{i}": gather_size_list[i] for i in range(ep_group.world_size)}
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】W8A8 All2All完成Token Combine - EP rank {ep_rank_id} combine token数量: {combine_info}, 合并后维度: {final_hidden_states.shape}")
     else:
         # TODO: Reorder device memory 2 times here, replace the current
         # implementation here when suitable operators become available.
@@ -528,6 +584,9 @@ def fused_experts_with_all2all(
         )
     if len(original_shape) == 3:
         final_hidden_states = final_hidden_states.view(original_shape)
+
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】W8A8 fused_experts_with_all2all 完成 - EP rank {ep_rank_id}")
     return final_hidden_states
 
 
@@ -935,8 +994,17 @@ class AscendW8A8DynamicFusedMoEMethod:
             )
 
         fused_moe_state = get_forward_context().fused_moe_state
+
+        # 添加W8A8 Dynamic MoE状态日志
+        layer_info = f"W8A8 Expert Layer"
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】{layer_info}，开始W8A8 Dynamic MoE处理 - 通信方案: {fused_moe_state}")
+            logger.info(f"【推理路径定位】{layer_info}，输入参数 - tokens: {x.shape[0]}, top_k: {top_k}, 专家数: {global_num_experts}")
+
         shared_gate_up, shared_dequant_scale = None, None
         if shared_experts is not None and fused_moe_state == FusedMoEState.MC2:
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】{layer_info}，处理共享专家 - FusedMoEState.MC2状态")
             with npu_stream_switch("moe_secondary", 0):
                 npu_wait_tensor(quantized_x_for_share, router_logits)
                 share_up_out, _ = shared_experts.gate_up_proj(
@@ -951,8 +1019,9 @@ class AscendW8A8DynamicFusedMoEMethod:
             topk_ids = torch.randint_like(topk_ids, 0, global_num_experts)
 
         topk_weights = topk_weights.to(x.dtype)
+
         if fused_moe_state == FusedMoEState.AllGatherEP:
-            return fused_experts_with_allgather(
+            result = fused_experts_with_allgather(
                 hidden_states=x,
                 w1=layer.w13_weight,
                 w1_scale=layer.w13_weight_scale,
@@ -962,8 +1031,11 @@ class AscendW8A8DynamicFusedMoEMethod:
                 topk_ids=topk_ids,
                 top_k=top_k,
                 expert_map=expert_map)
+            return result
         elif fused_moe_state == FusedMoEState.MC2:
-            return fused_experts_with_mc2(
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】{layer_info}，开始MC2 Token Dispatch和计算 - 使用硬件加速专家并行")
+            result = fused_experts_with_mc2(
                 hidden_states=x,
                 w1=layer.w13_weight,
                 w2=layer.w2_weight,
@@ -981,10 +1053,13 @@ class AscendW8A8DynamicFusedMoEMethod:
                 mc2_mask=kwargs.get("mc2_mask", None),
                 shared_gate_up=shared_gate_up,
                 shared_dequant_scale=shared_dequant_scale)
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】{layer_info}，MC2 Token Combine和计算完成")
+            return result
         elif fused_moe_state in [
                 FusedMoEState.AllGather, FusedMoEState.NaiveMulticast
         ]:
-            return fused_experts(hidden_states=x,
+            result = fused_experts(hidden_states=x,
                                  w1=layer.w13_weight,
                                  w1_scale=layer.w13_weight_scale,
                                  w2=layer.w2_weight,
@@ -993,12 +1068,15 @@ class AscendW8A8DynamicFusedMoEMethod:
                                  topk_ids=topk_ids,
                                  top_k=top_k,
                                  expert_map=expert_map)
+            return result
         else:
             # The current implementation of deepseek moe splits hidden_states
             # according to tp_size before they are feed into fused_moe module.
             # Therefore, all2all is needed no matter how dp/tp is set so as to
             # dispatch/combine tokens.
-            return fused_experts_with_all2all(
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】{layer_info}，开始All2All Token Dispatch - 使用EP组通信")
+            result = fused_experts_with_all2all(
                 hidden_states=x,
                 w1=layer.w13_weight,
                 w1_scale=layer.w13_weight_scale,
@@ -1012,6 +1090,9 @@ class AscendW8A8DynamicFusedMoEMethod:
                 log2phy=log2phy,
                 global_redundant_expert_num=global_redundant_expert_num,
             )
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】{layer_info}，All2All Token Combine完成")
+            return result
 
     def process_weights_after_loading(self, layer):
         if self.transpose_weight:

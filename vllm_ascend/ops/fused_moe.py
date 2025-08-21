@@ -26,8 +26,12 @@ from vllm.config import get_current_vllm_config
 from vllm.distributed import (GroupCoordinator, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
+from vllm.logger import init_logger
 from vllm.distributed.parallel_state import (get_dp_group, get_ep_group,
                                              get_tp_group)
+
+# 初始化全局logger
+logger = init_logger("vllm")
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe.config import \
     FusedMoEConfig  # isort: skip
@@ -135,6 +139,7 @@ def fused_experts_with_mc2(
     shared_experts: Optional[Any] = None,
     is_torchair: bool = False,
     mc2_mask: Optional[torch.Tensor] = None,
+    layer_idx: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     quant_mode = 0
     ep_rank_id = moe_parallel_config.ep_rank
@@ -179,6 +184,10 @@ def fused_experts_with_mc2(
 
     kwargs_mc2.update(stage1_kwargs)
 
+    # 添加dispatch开始日志
+    layer_info = f"Expert Layer {layer_idx}" if layer_idx is not None else "Expert Layer unknown"
+    logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id}开始dispatch")
+
     output = torch_npu.npu_moe_distribute_dispatch_v2(
         **kwargs_mc2
     ) if enable_dispatch_v2 else torch_npu.npu_moe_distribute_dispatch(
@@ -186,6 +195,9 @@ def fused_experts_with_mc2(
     # comm_stream.wait_stream(torch.npu.current_stream())
     expand_x, dynamic_scale, assist_info_for_combine, expert_token_nums, ep_recv_counts = output[
         0:5]
+
+    # 添加dispatch完成日志
+    logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id}完成dispatch收到所有token")
 
     if shared_experts is not None:
         with npu_stream_switch("moe_secondary", 0):
@@ -262,10 +274,16 @@ def fused_experts_with_mc2(
         })
     kwargs_mc2.update(stage3_kwargs)
 
+    # 添加combine开始日志
+    logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id} 开始combine】")
+
     hidden_states = torch_npu.npu_moe_distribute_combine_v2(
         **kwargs_mc2
     ) if enable_dispatch_v2 else torch_npu.npu_moe_distribute_combine(
         **kwargs_mc2)
+
+    # 添加combine完成日志
+    logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id} 完成combine】")
 
     if shared_experts is None:
         return hidden_states
@@ -1027,14 +1045,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         ascend_config = get_ascend_config()
         self.torchair_graph_enabled = ascend_config.torchair_graph_config.enabled
 
+
         try:
-            device_group = get_mc2_group().device_group
+            mc2_group = get_mc2_group()
+            device_group = mc2_group.device_group
             # TODO: Try local_rank = ep_group.rank_in_group
             local_rank = torch.distributed.get_rank(group=device_group)
             backend = device_group._get_backend(torch.device("npu"))
-            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(
-                local_rank)
-        except AttributeError:
+            self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+        except AttributeError as e:
+            self.moe_all_to_all_group_name = None
+        except Exception as e:
             self.moe_all_to_all_group_name = None
 
     def process_weights_after_loading(self, layer):
@@ -1067,6 +1088,10 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         shared_experts: Optional[Any] = None,
         **kwargs,
     ) -> torch.Tensor:
+
+        # 添加apply方法开始日志
+        layer_idx = getattr(layer, 'moe_instance_id', None)
+        layer_info = f"Expert Layer {layer_idx}" if layer_idx is not None else "Expert Layer unknown"
 
         is_deepseek_v3_r1 = global_num_experts == 256
         # NOTE: now npu_moe_gating_top_k can only support `group_count=256` pattern
@@ -1109,6 +1134,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         fused_moe_state = get_forward_context().fused_moe_state
 
         if fused_moe_state == FusedMoEState.MC2:
+            # 获取层号信息
+            layer_idx = getattr(layer, 'moe_instance_id', None)
             return fused_experts_with_mc2(
                 hidden_states=x,
                 w1=layer.w13_weight,
@@ -1120,7 +1147,8 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                 expert_map=expert_map,
                 moe_all_to_all_group_name=self.moe_all_to_all_group_name,
                 shared_experts=shared_experts,
-                mc2_mask=kwargs.get("mc2_mask", None))
+                mc2_mask=kwargs.get("mc2_mask", None),
+                layer_idx=layer_idx)
         elif fused_moe_state in [
                 FusedMoEState.AllGather, FusedMoEState.NaiveMulticast
         ]:
@@ -1200,10 +1228,20 @@ class AscendFusedMoE(FusedMoE):
         AscendFusedMoE.moe_counter += 1
         self.moe_instance_id = AscendFusedMoE.moe_counter
 
+        # 添加MoE实例初始化日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】AscendFusedMoE 初始化开始 - instance_id: {self.moe_instance_id}, prefix: {prefix}")
+
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
         vllm_config = get_current_vllm_config()
+
+        # 记录vLLM配置信息
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】vLLM并行配置 - EP size: TP * DP size, "
+                       f"TP size: {vllm_config.parallel_config.tensor_parallel_size}, "
+                       f"DP size: {vllm_config.parallel_config.data_parallel_size}")
 
         self.moe_parallel_config = FusedMoEParallelConfig.make(
             tp_size_=(tp_size if tp_size is not None else
@@ -1211,6 +1249,13 @@ class AscendFusedMoE(FusedMoE):
             dp_size_=(dp_size
                       if dp_size is not None else get_dp_group().world_size),
             vllm_parallel_config=vllm_config.parallel_config)
+
+        # 记录MoE并行配置
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】MoE并行配置创建完成 - EP rank: {self.moe_parallel_config.ep_rank}, "
+                       f"EP size: {self.moe_parallel_config.ep_size}, "
+                       f"TP size: {self.moe_parallel_config.tp_size}, "
+                       f"DP size: {self.moe_parallel_config.dp_size}")
 
         self.top_k = top_k
         self.num_experts = num_experts
@@ -1304,6 +1349,11 @@ class AscendFusedMoE(FusedMoE):
         # NOTE: self.tp_group is not expert_tp_group
         self.tp_group = get_tp_group().device_group
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+
+        # 在专家权重创建完成后打印专家加载统计信息
+        logger.info(f"【推理路径定位】EP Rank {self.moe_parallel_config.ep_rank}/{self.moe_parallel_config.ep_size} "
+                   f"专家权重加载完成 - Layer {self.moe_instance_id}, "
+                   f"本地路由专家数量: {self.local_num_experts}/{self.global_num_experts} (本地/全局)")
         self.token_dispatcher = None
         if envs_ascend.VLLM_ASCEND_ENABLE_MOE_ALL2ALL_SEQ and isinstance(
                 self.quant_method, AscendUnquantizedFusedMoEMethod):
@@ -1351,6 +1401,11 @@ class AscendFusedMoE(FusedMoE):
                 replace_allreduce: bool = False,
                 _metadata_for_padding: Optional[MetadataForPadding] = None):
 
+        # 添加AscendFusedMoE forward开始日志
+        layer_info = f"Expert Layer {self.moe_instance_id}"
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】{layer_info}，开始forward处理，is_prefill={is_prefill}")
+
         assert self.quant_method is not None
 
         if top_k:
@@ -1363,6 +1418,19 @@ class AscendFusedMoE(FusedMoE):
         forward_context = get_forward_context()
         fused_moe_state = forward_context.fused_moe_state
         mc2_mask = forward_context.mc2_mask
+
+        # 添加MoE状态决策日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】{layer_info}，获取到的MoE状态: {fused_moe_state}")
+            logger.info(f"【推理路径定位】{layer_info}，MC2 mask状态: {mc2_mask is not None}")
+
+        # 记录状态决策的关键因素
+        if fused_moe_state == FusedMoEState.MC2:
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】{layer_info}，状态检查通过 - 将使用MC2专家并行")
+        else:
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】{layer_info}，状态检查未通过 - 当前状态: {fused_moe_state}, 将使用标准MoE处理")
         # For w8a8 dynamic we can do npu_dynamic_quant and gate in parallel.
         quantized_x_for_share, dynamic_scale_for_share = None, None
         from vllm_ascend.quantization.w8a8_dynamic import \
@@ -1451,7 +1519,20 @@ class AscendFusedMoE(FusedMoE):
                     router_logits = self.naive_multicast(
                         router_logits, cu_tokens_across_dp_cpu)
 
+        # 添加专家计算阶段日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】{layer_info}，开始专家分派和计算阶段 - 输入大小: {hidden_states.shape}, top_k: {real_top_k}")
+            logger.info(f"【推理路径定位】{layer_info}，专家参数 - 专家数: {self.global_num_experts}, 专家组数: {self.num_expert_group}")
+
+        # 添加quant_method类型日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】执行quant_method.apply, quant_method 为 {self.quant_method.__class__.__name__}")
         # Matrix multiply.
+        # 添加quant_method.apply方法调用日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】quant_method.apply方法来自类: {self.quant_method.__class__.__module__}.{self.quant_method.__class__.__name__}")
+            logger.info(f"【推理路径定位】quant_method.apply方法定义: {self.quant_method.apply.__qualname__}")
+        
         e_hidden_states = self.quant_method.apply(
             layer=self,
             x=hidden_states,
@@ -1477,6 +1558,9 @@ class AscendFusedMoE(FusedMoE):
             quantized_x_for_share=quantized_x_for_share,
             dynamic_scale_for_share=dynamic_scale_for_share,
         )
+
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】{layer_info}，专家分派和计算阶段完成 - 输出shape: {e_hidden_states.shape if hasattr(e_hidden_states, 'shape') else 'tuple'}")
 
         if shared_experts:
             if isinstance(e_hidden_states, tuple):
@@ -1518,8 +1602,16 @@ class AscendFusedMoE(FusedMoE):
                 FusedMoEState.AllGather, FusedMoEState.AllGatherEP,
                 FusedMoEState.NaiveMulticast
         ]:
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】{layer_info}，执行最终TP AllReduce")
             final_hidden_states = tensor_model_parallel_all_reduce(
                 final_hidden_states)
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】{layer_info}，TP AllReduce完成")
+
+        # 添加AscendFusedMoE forward完成日志
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】{layer_info}，完成添加 AscendFusedMoE forward处理 - 最终输出shape: {final_hidden_states.shape}")
 
         if shared_experts:
             return final_hidden_states, shared_hidden_states
