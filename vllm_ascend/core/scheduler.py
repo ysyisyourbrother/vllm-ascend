@@ -14,6 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import os
 import time
 from collections import deque
 from typing import Iterable, Union
@@ -203,7 +204,8 @@ class AscendScheduler(Scheduler):
                 continue
 
             # 【节点6】请求被加入running队列
-            logger.info(f"【{request.request_id}，请求被加入running队列】")
+            if os.getenv('VLLM_REQUEST_LOG_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【{request.request_id}，请求被加入running队列】")
 
             self.running.append(request)
             if self.log_stats:

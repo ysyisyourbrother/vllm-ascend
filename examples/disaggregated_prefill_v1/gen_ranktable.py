@@ -158,13 +158,7 @@ else:
     # Default sequential allocation
     decode_devices = global_device_list[prefill_device_cnt:prefill_device_cnt + decode_device_cnt]
 
-# Add rank_id to prefill devices (starting from 0)
-for rank_id, device_info in enumerate(prefill_devices):
-    device_info["rank_id"] = rank_id
 
-# Add rank_id to decode devices (starting from 0)
-for rank_id, device_info in enumerate(decode_devices):
-    device_info["rank_id"] = rank_id
 
 ranktable = {
     "version":

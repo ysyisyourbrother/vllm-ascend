@@ -185,8 +185,9 @@ def fused_experts_with_mc2(
     kwargs_mc2.update(stage1_kwargs)
 
     # 添加dispatch开始日志
-    layer_info = f"Expert Layer {layer_idx}" if layer_idx is not None else "Expert Layer unknown"
-    logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id}开始dispatch")
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        layer_info = f"Expert Layer {layer_idx}" if layer_idx is not None else "Expert Layer unknown"
+        logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id}开始dispatch")
 
     output = torch_npu.npu_moe_distribute_dispatch_v2(
         **kwargs_mc2
@@ -197,7 +198,8 @@ def fused_experts_with_mc2(
         0:5]
 
     # 添加dispatch完成日志
-    logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id}完成dispatch收到所有token")
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id}完成dispatch收到所有token")
 
     if shared_experts is not None:
         with npu_stream_switch("moe_secondary", 0):
@@ -275,7 +277,8 @@ def fused_experts_with_mc2(
     kwargs_mc2.update(stage3_kwargs)
 
     # 添加combine开始日志
-    logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id} 开始combine】")
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id} 开始combine】")
 
     hidden_states = torch_npu.npu_moe_distribute_combine_v2(
         **kwargs_mc2
@@ -283,7 +286,8 @@ def fused_experts_with_mc2(
         **kwargs_mc2)
 
     # 添加combine完成日志
-    logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id} 完成combine】")
+    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+        logger.info(f"【推理路径定位】，{layer_info}， rank {ep_rank_id} 完成combine】")
 
     if shared_experts is None:
         return hidden_states
@@ -1351,7 +1355,8 @@ class AscendFusedMoE(FusedMoE):
         self.quant_method.create_weights(layer=self, **moe_quant_params)
 
         # 在专家权重创建完成后打印专家加载统计信息
-        logger.info(f"【推理路径定位】EP Rank {self.moe_parallel_config.ep_rank}/{self.moe_parallel_config.ep_size} "
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+            logger.info(f"【推理路径定位】EP Rank {self.moe_parallel_config.ep_rank}/{self.moe_parallel_config.ep_size} "
                    f"专家权重加载完成 - Layer {self.moe_instance_id}, "
                    f"本地路由专家数量: {self.local_num_experts}/{self.global_num_experts} (本地/全局)")
         self.token_dispatcher = None

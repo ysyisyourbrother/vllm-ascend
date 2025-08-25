@@ -28,6 +28,8 @@
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import os
+import time
+import json
 import torch
 import torch_npu
 from vllm.logger import init_logger
@@ -36,6 +38,45 @@ from vllm.logger import init_logger
 logger = init_logger("vllm")
 if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
     logger.info("【推理路径定位】DeepSeek V2/V3 模型文件已加载 - vllm_ascend.models.deepseek_v2")
+
+# 性能监控功能说明
+if os.getenv('VLLM_ATTENTION_PERF_MONITOR', 'false').lower() == 'true':
+    logger.info("【推理路径定位】Attention性能监控已启用 - 将收集所有forward阶段的执行时间数据")
+
+# 全局性能监控计数器和数据收集器
+# 使用方法：设置环境变量 VLLM_ATTENTION_PERF_MONITOR=true 启用性能监控
+# 数据格式：每个数据点包含 dp_rank, layer_index, step, execution_time_ms, timestamp
+# 输出文件：attention_performance_dp{rank}.json 和 attention_performance_dp{rank}_final.json
+_global_step_counter = 0
+_performance_data = []
+
+def save_attention_performance_data(force_save=False):
+    """保存Attention层性能数据到JSON文件"""
+    global _performance_data
+    if not _performance_data:
+        return
+
+    try:
+        from vllm.distributed.parallel_state import get_dp_group
+        dp_rank = get_dp_group().rank_in_group if get_dp_group().world_size > 1 else 0
+        output_file = f"attention_performance_dp{dp_rank}_final.json"
+
+        with open(output_file, 'w') as f:
+            json.dump(_performance_data, f, indent=2)
+
+        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true' or force_save:
+            logger.info(f"【推理路径定位】最终性能数据已保存到 {output_file}, 共 {len(_performance_data)} 条记录")
+
+        # 清空数据以释放内存
+        _performance_data.clear()
+
+    except Exception as e:
+        logger.warning(f"保存最终性能数据失败: {e}")
+
+# 注册程序退出时的清理函数
+import atexit
+atexit.register(save_attention_performance_data)
+
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
@@ -369,11 +410,13 @@ class CustomDeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
             # 共享专家创建完成后打印日志
-            logger.info(f"【推理路径定位】共享专家创建完成 - 共享专家数量: {config.n_shared_experts}, "
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】共享专家创建完成 - 共享专家数量: {config.n_shared_experts}, "
                        f"中间层大小: {intermediate_size}")
         else:
             self.shared_experts = None  # type: ignore
-            logger.info(f"【推理路径定位】当前模型无共享专家配置")
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】当前模型无共享专家配置")
         CustomDeepseekV2MoE.top_k = config.num_experts_per_tok
 
         self.dp_size = get_dp_group().world_size
@@ -595,12 +638,32 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             attn_metadata: Optional[AttentionMetadata] = None) -> torch.Tensor:
         if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
             logger.info(f"【推理路径定位】Attention Layer {self.debug_layer_idx} forward开始 - hidden_states shape: {hidden_states.shape}")
-        
+
         forward_context = get_forward_context()
         enable_multistream_mla = (self.enable_multistream_mla
                                   and attn_metadata is not None
                                   and not forward_context.with_prefill
                                   and attn_metadata.num_decodes > 0)
+
+        # 性能监控：根据专用环境变量决定是否收集数据
+        should_monitor = os.getenv('VLLM_ATTENTION_PERF_MONITOR', 'false').lower() == 'true'
+
+        if should_monitor:
+            # 获取当前step计数器并递增
+            global _global_step_counter
+            _global_step_counter += 1
+            current_step = _global_step_counter
+
+            # 获取DP rank
+            from vllm.distributed.parallel_state import get_dp_group
+            dp_rank = get_dp_group().rank_in_group if get_dp_group().world_size > 1 else 0
+
+            # NPU同步并记录开始时间
+            torch_npu.npu.synchronize()
+            start_time = time.perf_counter()
+
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】开始性能监控 - Layer {self.debug_layer_idx}, Step {current_step}, DP Rank {dp_rank}")
         forward_kwargs = {"enable_multistream_mla": enable_multistream_mla}
         if self.q_lora_rank is not None:
             npu_prefetch(self.q_a_proj.weight,
@@ -611,6 +674,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             forward_kwargs['ckq'] = ckq
         else:
             hidden_states_or_q_c = hidden_states
+        # 执行实际的attention计算
         if self.torchair_graph_enabled:
             output_shape = hidden_states.shape
             output = torch.empty(output_shape,
@@ -623,7 +687,6 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                                                 attn_metadata,
                                                 **forward_kwargs)
             output = output.view(-1, output_shape[-1])
-            return output
         else:
             kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -634,7 +697,42 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                                  output_shape=hidden_states.shape)
             if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
                 logger.info(f"【推理路径定位】Attention Layer {self.debug_layer_idx} forward完成 (torchair_graph_enabled = False) - output shape: {output.shape}")
-            return output
+
+        # 性能监控：记录结束时间并收集数据
+        if should_monitor:
+            # NPU同步并记录结束时间
+            torch_npu.npu.synchronize()
+            end_time = time.perf_counter()
+            execution_time = (end_time - start_time) * 1000  # 转换为毫秒
+
+            # 收集性能数据
+            perf_data = {
+                "dp_rank": dp_rank,
+                "layer_index": self.debug_layer_idx,
+                "step": current_step,
+                "execution_time_ms": execution_time,
+                "timestamp": end_time
+            }
+
+            global _performance_data
+            _performance_data.append(perf_data)
+
+            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                logger.info(f"【推理路径定位】性能监控完成 - Layer {self.debug_layer_idx}, Step {current_step}, "
+                           f"执行时间: {execution_time:.3f}ms, DP Rank {dp_rank}")
+
+            # 定期保存性能数据到JSON文件
+            if len(_performance_data) % 100 == 0:  # 每100个数据点保存一次
+                try:
+                    output_file = f"attention_performance_dp{dp_rank}.json"
+                    with open(output_file, 'w') as f:
+                        json.dump(_performance_data, f, indent=2)
+                    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
+                        logger.info(f"【推理路径定位】性能数据已保存到 {output_file}, 共 {len(_performance_data)} 条记录")
+                except Exception as e:
+                    logger.warning(f"保存性能数据失败: {e}")
+
+        return output
 
 class CustomDeepseekV2DecoderLayer(DeepseekV2DecoderLayer):
 
