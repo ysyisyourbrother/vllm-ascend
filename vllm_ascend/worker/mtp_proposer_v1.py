@@ -254,10 +254,20 @@ class MtpProposer:
         assert len(draft_attn_layer_names) == 1
         self.attn_layer_name = next(iter(draft_attn_layer_names))
 
-        self.model.load_weights(
-            loader.get_all_weights(
-                self.vllm_config.speculative_config.draft_model_config,
-                self.model))
+        # self.model.load_weights(
+        #     loader.get_all_weights(
+        #         self.vllm_config.speculative_config.draft_model_config,
+        #         self.model))
+        # replace with: 
+        from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader 
+        from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weights 
+        if isinstance(loader, DummyModelLoader): 
+            initialize_dummy_weights(self.model) 
+        else: 
+            self.model.load_weights(
+                loader.get_all_weights(
+                    self.vllm_config.speculative_config.draft_model_config, 
+                    self.model))
         process_weights_after_loading(self.model, draft_model_config,
                                       target_device)
 
