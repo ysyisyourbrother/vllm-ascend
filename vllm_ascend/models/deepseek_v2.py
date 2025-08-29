@@ -29,7 +29,6 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import os
 import time
-import json
 import torch
 import torch_npu
 from vllm.logger import init_logger
@@ -41,41 +40,13 @@ if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
 
 # 性能监控功能说明
 if os.getenv('VLLM_ATTENTION_PERF_MONITOR', 'false').lower() == 'true':
-    logger.info("【推理路径定位】Attention性能监控已启用 - 将收集所有forward阶段的执行时间数据")
+    logger.info("【推理路径定位】Attention性能监控已启用 - 将以日志形式记录所有forward阶段的执行时间数据")
 
-# 全局性能监控计数器和数据收集器
+# 全局性能监控计数器
 # 使用方法：设置环境变量 VLLM_ATTENTION_PERF_MONITOR=true 启用性能监控
-# 数据格式：每个数据点包含 dp_rank, layer_index, step, execution_time_ms, timestamp
-# 输出文件：attention_performance_dp{rank}.json 和 attention_performance_dp{rank}_final.json
+# 数据格式：通过vllm logger以特定格式记录性能数据，格式为 [ATTENTION_PERF]|数据内容
+# step表示完整模型前向传播的次数，在CustomDeepseekV2ForCausalLM.forward中递增
 _global_step_counter = 0
-_performance_data = []
-
-def save_attention_performance_data(force_save=False):
-    """保存Attention层性能数据到JSON文件"""
-    global _performance_data
-    if not _performance_data:
-        return
-
-    try:
-        from vllm.distributed.parallel_state import get_dp_group
-        dp_rank = get_dp_group().rank_in_group if get_dp_group().world_size > 1 else 0
-        output_file = f"attention_performance_dp{dp_rank}_final.json"
-
-        with open(output_file, 'w') as f:
-            json.dump(_performance_data, f, indent=2)
-
-        if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true' or force_save:
-            logger.info(f"【推理路径定位】最终性能数据已保存到 {output_file}, 共 {len(_performance_data)} 条记录")
-
-        # 清空数据以释放内存
-        _performance_data.clear()
-
-    except Exception as e:
-        logger.warning(f"保存最终性能数据失败: {e}")
-
-# 注册程序退出时的清理函数
-import atexit
-atexit.register(save_attention_performance_data)
 
 from torch import nn
 from transformers import PretrainedConfig
@@ -646,13 +617,10 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                                   and attn_metadata.num_decodes > 0)
 
         # 性能监控：根据专用环境变量决定是否收集数据
-        should_monitor = os.getenv('VLLM_ATTENTION_PERF_MONITOR', 'false').lower() == 'true'
-
-        if should_monitor:
-            # 获取当前step计数器并递增
+        perf_monitor_enabled = os.getenv('VLLM_ATTENTION_PERF_MONITOR', 'false').lower() == 'true'
+        if perf_monitor_enabled:
+            # 获取当前step（由模型主forward方法管理）
             global _global_step_counter
-            _global_step_counter += 1
-            current_step = _global_step_counter
 
             # 获取DP rank
             from vllm.distributed.parallel_state import get_dp_group
@@ -662,8 +630,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             torch_npu.npu.synchronize()
             start_time = time.perf_counter()
 
-            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
-                logger.info(f"【推理路径定位】开始性能监控 - Layer {self.debug_layer_idx}, Step {current_step}, DP Rank {dp_rank}")
+            logger.info(f"【性能监控】开始性能监控 - Layer {self.debug_layer_idx}, Step {_global_step_counter}, DP Rank {dp_rank}")
         forward_kwargs = {"enable_multistream_mla": enable_multistream_mla}
         if self.q_lora_rank is not None:
             npu_prefetch(self.q_a_proj.weight,
@@ -698,39 +665,21 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
                 logger.info(f"【推理路径定位】Attention Layer {self.debug_layer_idx} forward完成 (torchair_graph_enabled = False) - output shape: {output.shape}")
 
-        # 性能监控：记录结束时间并收集数据
-        if should_monitor:
+        # 性能监控：记录结束时间并以日志形式记录数据
+        if perf_monitor_enabled:
             # NPU同步并记录结束时间
             torch_npu.npu.synchronize()
             end_time = time.perf_counter()
             execution_time = (end_time - start_time) * 1000  # 转换为毫秒
 
-            # 收集性能数据
-            perf_data = {
-                "dp_rank": dp_rank,
-                "layer_index": self.debug_layer_idx,
-                "step": current_step,
-                "execution_time_ms": execution_time,
-                "timestamp": end_time
-            }
+            # 直接使用vllm logger记录性能数据，使用特定格式标识
+            perf_message = f"dp_rank={dp_rank}|layer_index={self.debug_layer_idx}|step={_global_step_counter}|execution_time_ms={execution_time:.3f}|timestamp={end_time:.6f}"
 
-            global _performance_data
-            _performance_data.append(perf_data)
+            # 使用特定前缀标识性能数据，便于解析脚本识别
+            logger.info(f"[ATTENTION_PERF]|{perf_message}")
 
-            if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
-                logger.info(f"【推理路径定位】性能监控完成 - Layer {self.debug_layer_idx}, Step {current_step}, "
-                           f"执行时间: {execution_time:.3f}ms, DP Rank {dp_rank}")
-
-            # 定期保存性能数据到JSON文件
-            if len(_performance_data) % 100 == 0:  # 每100个数据点保存一次
-                try:
-                    output_file = f"attention_performance_dp{dp_rank}.json"
-                    with open(output_file, 'w') as f:
-                        json.dump(_performance_data, f, indent=2)
-                    if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
-                        logger.info(f"【推理路径定位】性能数据已保存到 {output_file}, 共 {len(_performance_data)} 条记录")
-                except Exception as e:
-                    logger.warning(f"保存性能数据失败: {e}")
+            logger.info(f"【性能监控】性能监控完成 - Layer {self.debug_layer_idx}, Step {_global_step_counter}, "
+                       f"执行时间: {execution_time:.3f}ms, DP Rank {dp_rank}")
 
         return output
 
@@ -1133,6 +1082,11 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        # 性能监控：在完整模型forward开始时递增step计数器
+        if os.getenv('VLLM_ATTENTION_PERF_MONITOR', 'false').lower() == 'true':
+            global _global_step_counter
+            _global_step_counter += 1
+
         # 添加主模型forward开始日志
         if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
             logger.info(f"【推理路径定位】CustomDeepseekV2ForCausalLM forward开始 - input_ids shape: {input_ids.shape if input_ids is not None else 'None'}")

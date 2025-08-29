@@ -24,6 +24,7 @@ import os
 import time
 import types
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union, cast
@@ -107,6 +108,17 @@ import torch_npu
 import vllm.envs as envs_vllm
 
 import vllm_ascend.envs as envs_ascend
+
+# Global ThreadPoolExecutor for simulated KV cache operations
+_kv_simulation_executor = None
+
+
+def _get_kv_simulation_executor():
+    """Get or create the global ThreadPoolExecutor for KV cache simulation"""
+    global _kv_simulation_executor
+    if _kv_simulation_executor is None:
+        _kv_simulation_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="kv_sim")
+    return _kv_simulation_executor
 
 if is_310p():
     torch_npu.npu.set_compile_mode(jit_compile=False)
@@ -1820,6 +1832,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
     @staticmethod
     def maybe_setup_kv_connector(scheduler_output: "SchedulerOutput"):
+        # KV Cache模拟：如果启用则跳过connector，使用异步方式生成随机KV cache
+        if os.getenv('VLLM_SIMULATE_KV_CACHE', 'false').lower() == 'true':
+            NPUModelRunner._start_simulated_kv_cache(scheduler_output)
+            return
+
         # Update KVConnector with the KVConnector metadata forward().
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
@@ -1829,6 +1846,85 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.kv_connector_metadata)
 
             kv_connector.start_load_kv(get_forward_context())
+
+    @staticmethod
+    def _start_simulated_kv_cache(scheduler_output: "SchedulerOutput") -> None:
+        """异步启动KV cache模拟，对照start_load_kv的futures逻辑"""
+        kv_connector = get_kv_transfer_group()
+
+        # Clean up finished requests first
+        if len(kv_connector.transfered_req_ids):
+            for req_id in scheduler_output.finished_req_ids:
+                kv_connector.del_transfered_req(req_id)
+
+        # Bind metadata like the original start_load_kv
+        assert isinstance(kv_connector, KVConnectorBase_V1)
+        assert scheduler_output.kv_connector_metadata is not None
+        kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        metadata = kv_connector._connector_metadata
+
+        # Submit async tasks for each request, similar to start_load_kv
+        executor = _get_kv_simulation_executor()
+        futures = []
+
+        for req_id, req_meta in metadata.requests.items():
+            transfered_reqs = kv_connector.transfered_req_ids
+            if req_id in transfered_reqs:
+                continue
+
+            # Submit async task for this request
+            future = executor.submit(
+                NPUModelRunner._simulate_kv_for_request,
+                kv_connector,
+                req_id,
+                req_meta
+            )
+            futures.append(future)
+
+        # Add exception handling callbacks like the original
+        def handle_exception(future):
+            if future.exception():
+                logger.error(f"KV simulation task failed: {future.exception()}")
+
+        for future in futures:
+            future.add_done_callback(handle_exception)
+
+    @staticmethod
+    def _simulate_kv_for_request(kv_connector, req_id: str, req_meta) -> None:
+        """为单个请求模拟KV cache的具体实现，在后台线程中执行"""
+        try:
+            # Mark request as being transferred
+            kv_connector.add_transfered_req(req_id)
+            connector_worker = kv_connector.connector_worker
+
+            # Get local block IDs
+            local_block_ids = req_meta.local_block_ids
+            num_local_blocks = len(local_block_ids)
+
+            if num_local_blocks == 0:
+                # Even if no blocks, mark as finished
+                with connector_worker.thread_lock:
+                    connector_worker.finished_reqs.add(req_id)
+                return
+
+            # Generate random KV cache data
+            k_nope_cache_tensor_list, k_pe_cache_tensor_list = connector_worker.cache_tensor
+            for block_id in local_block_ids:
+                for layer_idx in range(len(k_nope_cache_tensor_list)):
+                    k_nope_cache_tensor = k_nope_cache_tensor_list[layer_idx]
+                    k_pe_cache_tensor = k_pe_cache_tensor_list[layer_idx]
+                    k_nope_cache_tensor[block_id] = torch.randn_like(k_nope_cache_tensor[block_id]) * 0.1
+                    k_pe_cache_tensor[block_id] = torch.randn_like(k_pe_cache_tensor[block_id]) * 0.1
+
+            # Mark request as finished
+            with connector_worker.thread_lock:
+                connector_worker.finished_reqs.add(req_id)
+
+        except Exception as e:
+            logger.error(f"【KV模拟】请求 {req_id} 的KV cache模拟失败: {e}")
+            # Ensure request is marked as finished even on error
+            with connector_worker.thread_lock:
+                connector_worker.finished_reqs.add(req_id)
 
     @staticmethod
     def maybe_wait_for_kv_save() -> None:

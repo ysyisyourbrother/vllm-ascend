@@ -28,6 +28,9 @@ from vllm_ascend.worker.npu_input_batch import InputBatch
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
+from vllm.logger import init_logger
+# 添加模块加载日志
+logger = init_logger("vllm")
 
 class AscendMLABackend(AttentionBackend):
 

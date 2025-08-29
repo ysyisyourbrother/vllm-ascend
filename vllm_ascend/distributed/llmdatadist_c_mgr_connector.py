@@ -88,6 +88,7 @@ class LLMDataDistCMgrConnector(KVConnectorBase_V1):
     def __init__(self, vllm_config: VllmConfig, role: KVConnectorRole):
         assert vllm_config.kv_transfer_config is not None
         self.engine_id = vllm_config.kv_transfer_config.engine_id
+        self.transfered_req_ids = set()
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: Optional[
                 LLMDataDistCMgrConnectorScheduler] = LLMDataDistCMgrConnectorScheduler(
@@ -128,6 +129,19 @@ class LLMDataDistCMgrConnector(KVConnectorBase_V1):
     ) -> tuple[bool, Optional[dict[str, Any]]]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
+
+    def add_transfered_req(
+        self,
+        req_id: str
+    ) -> None:
+        self.transfered_req_ids.add(req_id)
+
+    def del_transfered_req(
+        self,
+        req_id: str
+    ) -> None:
+        if req_id in self.transfered_req_ids:
+            self.transfered_req_ids.remove(req_id)
 
     ############################################################
     # Worker Side Methods
@@ -517,12 +531,17 @@ class LLMDataDistCMgrConnectorWorker():
             cache_k_pe_addr_list = []
             k_normed = None
             k_pe = None
+            cache_k_normed_tensor_list = []
+            cache_k_pe_tensor_list = []
             for cache_or_caches in kv_caches.values():
                 assert len(cache_or_caches) > 1
                 k_normed, k_pe = cache_or_caches[0], cache_or_caches[1]
                 cache_k_normed_addr_list.append(k_normed.data_ptr())
                 cache_k_pe_addr_list.append(k_pe.data_ptr())
+                cache_k_normed_tensor_list.append(k_normed)
+                cache_k_pe_tensor_list.append(k_pe)
             self.cache_addr = (cache_k_normed_addr_list, cache_k_pe_addr_list)
+            self.cache_tensor = (cache_k_normed_tensor_list, cache_k_pe_tensor_list)
 
             cache_desc_k_normed = CacheDesc(
                 len(self.cache_addr[0]), [*k_normed.shape],
