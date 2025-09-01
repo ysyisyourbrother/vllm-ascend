@@ -1176,6 +1176,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                 decode_kv,
                                 enabled=enable_multistream_mla)
 
+            # q_c, q_pe
             decode_ql_nope, decode_q_pe = \
                 self._q_proj_and_k_up_proj(decode_hs_or_q_c)
             if self.running_in_graph:
@@ -1259,6 +1260,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             else:
                 output[num_decode_tokens:] = output_prefill
 
+        # core attention
         if has_decode:
             if self.running_in_graph:
                 return self._forward_decode(decode_ql_nope, decode_q_pe,

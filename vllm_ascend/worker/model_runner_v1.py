@@ -163,7 +163,8 @@ def graph_capture(device: torch.device):
 
 class NPUModelRunner(LoRAModelRunnerMixin):
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device, worker=None):
+        self.worker = worker
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -379,12 +380,196 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # NOTE: we need to use `in_profile_run` to determine whether `enable_force_load_balance` is True
         self.in_profile_run = False
 
+        # Brandon: Profile control variables
+        self._profile_total_tokens_threshold = int(os.getenv('PROFILE_TOTAL_TOKENS_THRESHOLD', '0'))
+        self._profile_active = False
+        self._profile_finish = False
+        self._profile_step_counter = 0
+        # Token tracking variables for multi-worker profile coordination
+        self._profile_sync_dir = os.getenv('PROFILE_SYNC_DIR', '/tmp/vllm_profile_sync')
+        self._profile_tokens_file = os.path.join(self._profile_sync_dir, f"worker_{self.dp_rank}_tokens")
+        self._profile_waiting_file = os.path.join(self._profile_sync_dir, f"worker_{self.dp_rank}_waiting")
+
         # kv role
         self.is_kv_producer = False
         self.is_kv_consumer = False
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+
+    # Brandon:
+    def _handle_profile_logic(self, scheduler_output) -> None:
+        """Handle profile start/stop logic based on total token count and waiting queue status across all workers"""
+        # Skip if PROFILE_TOTAL_TOKENS_THRESHOLD is not set or invalid
+        if self._profile_total_tokens_threshold <= 0:
+            return
+        # Skip if worker or profiler is not available
+        if not self.worker or not self.worker.profiler:
+            return
+
+        current_tokens = scheduler_output.total_num_scheduled_tokens
+        current_waiting_reqs = scheduler_output.num_waiting_reqs
+
+        # Update this worker's token count and waiting queue status to files
+        self._update_worker_tokens(current_tokens)
+        self._update_worker_waiting_status(current_waiting_reqs)
+
+        # Check if we should start profiling based on total tokens and waiting queue status across all workers
+        if not self._profile_active and not self._profile_finish:
+            total_tokens = self._get_total_tokens_across_workers()
+            all_waiting_empty = self._check_all_waiting_queues_empty()
+
+            if total_tokens >= self._profile_total_tokens_threshold and all_waiting_empty:
+                try:
+                    self.worker.profiler.start()
+                    self._profile_active = True
+                    self._profile_step_counter = 0
+                    logger.info(f"Profile started successfully on worker rank {self.dp_rank} - total tokens across all workers: {total_tokens}, threshold: {self._profile_total_tokens_threshold}, all waiting queues empty: {all_waiting_empty}")
+                except Exception as e:
+                    logger.warning(f"Failed to start profiler: {e}")
+
+        # Check if we should stop profiling after 10 steps
+        elif self._profile_active and not self._profile_finish:
+            self._profile_step_counter += 1
+            if self._profile_step_counter >= 10:
+                try:
+                    self.worker.profiler.stop()
+                    self._profile_active = False
+                    self._profile_finish = True     # Only run profile once
+
+                    # Get queue information for logging
+                    waiting_reqs = scheduler_output.num_waiting_reqs
+                    running_reqs = scheduler_output.num_running_reqs
+                    waiting_kv_cache = scheduler_output.waiting_queue_kv_cache_length
+                    running_kv_cache = scheduler_output.running_queue_kv_cache_length
+                    total_kv_cache = waiting_kv_cache + running_kv_cache
+
+                    logger.info(f"Profile stopped successfully on worker rank {self.dp_rank} after {self._profile_step_counter} steps - "
+                               f"waiting queue: {waiting_reqs} reqs, running queue: {running_reqs} reqs, "
+                               f"total KV cache length: {total_kv_cache} (waiting: {waiting_kv_cache}, running: {running_kv_cache})")
+
+                    # Log all requests sorted by KV cache length (from long to short)
+                    self._log_requests_by_kv_cache_length(scheduler_output)
+
+                    self._profile_step_counter = 0
+                    # Clean up sync files when profiling is complete
+                    self._cleanup_token_files()
+                except Exception as e:
+                    logger.warning(f"Failed to stop profiler: {e}")
+
+    def _log_requests_by_kv_cache_length(self, scheduler_output) -> None:
+        """Log all requests sorted by KV cache length from long to short"""
+        try:
+            # Collect all request information
+            request_info_list = []
+
+            # Get all requests from self.requests (cached request states)
+            for req_id, req_state in self.requests.items():
+                # Calculate KV cache length (total tokens = prompt + output tokens)
+                kv_cache_length = req_state.num_tokens
+                request_info_list.append({
+                    'req_id': req_id,
+                    'kv_cache_length': kv_cache_length
+                })
+
+            # Sort by KV cache length from long to short
+            request_info_list.sort(key=lambda x: x['kv_cache_length'], reverse=True)
+
+            # Log all requests in one line - format: req_id:kv_length,req_id:kv_length,...
+            if request_info_list:
+                request_pairs = [f"{req['req_id']}:{req['kv_cache_length']}" for req in request_info_list]
+                requests_str = ",".join(request_pairs)
+                logger.info(f"[WORKER_KV_SORTED] Worker_{self.dp_rank}: {requests_str}")
+            else:
+                logger.info(f"[WORKER_KV_SORTED] Worker_{self.dp_rank}: No requests found")
+
+        except Exception as e:
+            logger.warning(f"Failed to log requests by KV cache length: {e}")
+
+    def _update_worker_tokens(self, current_tokens: int) -> None:
+        """Update this worker's token count to its dedicated file"""
+        try:
+            os.makedirs(self._profile_sync_dir, exist_ok=True)
+            with open(self._profile_tokens_file, 'w') as f:
+                f.write(str(current_tokens))
+        except Exception as e:
+            logger.warning(f"Failed to update worker {self.dp_rank} token count: {e}")
+
+    def _update_worker_waiting_status(self, waiting_reqs: int) -> None:
+        """Update this worker's waiting queue status to its dedicated file"""
+        try:
+            os.makedirs(self._profile_sync_dir, exist_ok=True)
+            with open(self._profile_waiting_file, 'w') as f:
+                f.write(str(waiting_reqs))
+        except Exception as e:
+            logger.warning(f"Failed to update worker {self.dp_rank} waiting status: {e}")
+
+    def _get_total_tokens_across_workers(self) -> int:
+        """Get the total token count across all workers by reading their token files"""
+        total_tokens = 0
+        try:
+            if not os.path.exists(self._profile_sync_dir):
+                return 0
+
+            for rank in range(self.dp_size):
+                token_file = os.path.join(self._profile_sync_dir, f"worker_{rank}_tokens")
+                if os.path.exists(token_file):
+                    try:
+                        with open(token_file, 'r') as f:
+                            worker_tokens = int(f.read().strip())
+                            total_tokens += worker_tokens
+                    except (ValueError, IOError) as e:
+                        logger.warning(f"Failed to read tokens from worker {rank}: {e}")
+                        continue
+
+            return total_tokens
+        except Exception as e:
+            logger.warning(f"Failed to get total tokens across workers: {e}")
+            return 0
+
+    def _check_all_waiting_queues_empty(self) -> bool:
+        """Check if all workers' waiting queues are empty by reading their waiting status files"""
+        try:
+            if not os.path.exists(self._profile_sync_dir):
+                return False
+
+            for rank in range(self.dp_size):
+                waiting_file = os.path.join(self._profile_sync_dir, f"worker_{rank}_waiting")
+                if os.path.exists(waiting_file):
+                    try:
+                        with open(waiting_file, 'r') as f:
+                            waiting_reqs = int(f.read().strip())
+                            if waiting_reqs > 0:
+                                return False  # Found a non-empty waiting queue
+                    except (ValueError, IOError) as e:
+                        logger.warning(f"Failed to read waiting status from worker {rank}: {e}")
+                        return False  # If we can't read, assume not empty for safety
+                else:
+                    # If file doesn't exist, assume waiting queue is not empty for safety
+                    return False
+
+            # All workers have empty waiting queues
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to check waiting queues across workers: {e}")
+            return False
+
+    def _cleanup_token_files(self) -> None:
+        """Clean up token and waiting status files after profiling is complete"""
+        try:
+            if os.path.exists(self._profile_sync_dir):
+                for filename in os.listdir(self._profile_sync_dir):
+                    if (filename.startswith("worker_") and
+                        (filename.endswith("_tokens") or filename.endswith("_waiting"))):
+                        file_path = os.path.join(self._profile_sync_dir, filename)
+                        os.remove(file_path)
+                # Try to remove the directory if it's empty
+                try:
+                    os.rmdir(self._profile_sync_dir)
+                except OSError:
+                    pass  # Directory not empty or other error, ignore
+        except Exception as e:
+            logger.warning(f"Failed to cleanup token and waiting files: {e}")
 
     def check_batch_sizes_consistency(self) -> None:
         if not dist.is_initialized():
@@ -1029,6 +1214,64 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 mm_embeds.append(mm_embeds_item)
         return mm_embeds
 
+    # brandon: 将请求按照kv cache长度排序
+    def _sort_batch_by_kv_cache_length(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Sort decode requests in the batch by KV cache length in descending order.
+
+        In PD separation architecture, decode instance only handles decode requests,
+        so we can directly sort all requests by their KV cache length without
+        considering decode/prefill separation.
+
+        Args:
+            scheduler_output: The scheduler output containing request information
+
+        Returns:
+            bool: True if the batch was modified, False otherwise
+        """
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs <= 1:
+            return False
+
+        # Get KV cache lengths for all decode requests in the batch
+        req_kv_lengths = []
+        for i in range(num_reqs):
+            req_id = self.input_batch.req_ids[i]
+            # Calculate total KV cache length: prompt + output tokens
+            total_tokens = (self.input_batch.num_prompt_tokens[i] +
+                           len(self.input_batch.req_output_token_ids[i] or []))
+            req_kv_lengths.append((i, req_id, total_tokens))
+
+        # Sort all requests by KV cache length (descending order)
+        req_kv_lengths.sort(key=lambda x: x[2], reverse=True)
+
+        # Perform the reordering using swap operations
+        modified = False
+        for target_pos, (_, req_id, _) in enumerate(req_kv_lengths):
+            # Find where this request currently is
+            current_pos = None
+            for i in range(target_pos, num_reqs):
+                if self.input_batch.req_ids[i] == req_id:
+                    current_pos = i
+                    break
+
+            if current_pos is not None and current_pos != target_pos:
+                # Swap the request to its target position
+                self.input_batch.swap_states(target_pos, current_pos)
+                modified = True
+
+        # Optional debug logging
+        if modified and os.getenv('VLLM_WORKER_KV_SORT_DEBUG', 'false').lower() == 'true':
+            sorted_info = []
+            for i in range(num_reqs):
+                req_id = self.input_batch.req_ids[i]
+                kv_length = (self.input_batch.num_prompt_tokens[i] +
+                           len(self.input_batch.req_output_token_ids[i] or []))
+                sorted_info.append(f"{req_id}({kv_length})")
+            logger.info(f"【Worker KV排序】按KV cache长度排序 - 共{num_reqs}个decode请求: " +
+                       ", ".join(sorted_info))
+
+        return modified
+
     def _process_reqs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1055,6 +1298,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.input_batch, scheduler_output)
         if modified_batch:
             self.input_batch.refresh_sampling_metadata()
+
+        # Brandon: Additional sorting by KV cache length within decode/prefill groups
+        if os.getenv('VLLM_ENABLE_WORKER_KV_SORTING', 'false').lower() == 'true':
+            kv_sort_modified = self._sort_batch_by_kv_cache_length(scheduler_output)
+            if kv_sort_modified:
+                self.input_batch.refresh_sampling_metadata()
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -1610,6 +1859,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     # Return empty ModelRunnerOuptut if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output)
+            
+            # Log final queue status at the end of scheduling step
+            # if os.getenv('VLLM_SCHEDULE_PATH_DEBUG', 'false').lower() == 'true':
+            #     logger.info(f"【调度路径定位】调度step完成 - 本次调度token数: {scheduler_output.total_num_scheduled_tokens}")
+
+            # Brandon Handle profile logic based on token count
+            self._handle_profile_logic(scheduler_output)
+
             (attn_metadata, hidden_states, spec_decode_metadata, positions,
              num_scheduled_tokens, logits_indices, aux_hidden_states,
              num_scheduled_tokens_np, finished_sending,

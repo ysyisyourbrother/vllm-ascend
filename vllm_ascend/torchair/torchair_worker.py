@@ -58,4 +58,4 @@ class NPUTorchairWorker(NPUWorker):
         """Override init_device to init torchair model runner"""
         device = self._init_device()
         # Init ModelRunner here, so that we have access to self.device.
-        self.model_runner = NPUTorchairModelRunner(self.vllm_config, device)
+        self.model_runner = NPUTorchairModelRunner(self.vllm_config, device, worker=self)
