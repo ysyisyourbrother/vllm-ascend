@@ -100,6 +100,11 @@ class NPUWorker(WorkerBase):
 
         self.profiler = self._init_profiler()
 
+        # TODO(Brandon) Set profiler for MLA attention profiling
+        if self.profiler is not None:
+            import vllm_ascend.models.deepseek_v2 as deepseek_v2
+            deepseek_v2._worker_profiler = self.profiler
+
     def sleep(self, level: int = 1) -> None:
         if not sleep_mode_enabled():
             raise ValueError(
@@ -144,7 +149,7 @@ class NPUWorker(WorkerBase):
     def init_device(self):
         device = self._init_device()
         # Init ModelRunner here, so that we have access to self.device.
-        self.model_runner = NPUModelRunner(self.vllm_config, device)
+        self.model_runner = NPUModelRunner(self.vllm_config, device, worker=self)
 
     def determine_available_memory(self) -> int:
         # Profile the memory usage of the model and get the maximum number of

@@ -163,7 +163,8 @@ def graph_capture(device: torch.device):
 
 class NPUModelRunner(LoRAModelRunnerMixin):
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device, worker=None):
+        self.worker = worker
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -379,12 +380,114 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # NOTE: we need to use `in_profile_run` to determine whether `enable_force_load_balance` is True
         self.in_profile_run = False
 
+        # Brandon: Profile control variables
+        self._profile_target_tokens = int(os.getenv('PROFILE_TARGET_TOKENS', '0'))
+        self._profile_active = False
+        self._profile_finish = False
+        self._profile_step_counter = 0
+        # Synchronization variables for multi-worker profile coordination
+        self._profile_sync_dir = os.getenv('PROFILE_SYNC_DIR', '/tmp/vllm_profile_sync')
+        self._profile_ready_threshold = 64  # Fixed threshold for synchronization
+        self._profile_ready_marked = False  # Whether this worker has marked itself as ready
+
         # kv role
         self.is_kv_producer = False
         self.is_kv_consumer = False
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+
+    # Brandon:
+    def _handle_profile_logic(self, scheduler_output) -> None:
+        """Handle profile start/stop logic based on token count with multi-worker synchronization"""
+        # Skip if PROFILE_TARGET_TOKENS is not set or invalid
+        if self._profile_target_tokens <= 0:
+            return
+        # Skip if worker or profiler is not available
+        if not self.worker or not self.worker.profiler:
+            return
+
+        current_tokens = scheduler_output.total_num_scheduled_tokens
+
+        # Check if we should start profiling with synchronization
+        if not self._profile_active and current_tokens == self._profile_ready_threshold and not self._profile_finish:
+            # Mark this worker as ready if not already marked
+            if not self._profile_ready_marked:
+                self._mark_worker_ready()
+                self._profile_ready_marked = True
+                logger.info(f"Worker rank {self.dp_rank} marked as ready at {current_tokens} tokens")
+
+            # Check if all workers are ready and current tokens match target
+            if current_tokens == self._profile_target_tokens and self._check_all_workers_ready():
+                try:
+                    self.worker.profiler.start()
+                    self._profile_active = True
+                    self._profile_step_counter = 0
+                    logger.info(f"Profile started successfully on worker rank {self.dp_rank} at step with {current_tokens} tokens")
+                except Exception as e:
+                    logger.warning(f"Failed to start profiler: {e}")
+
+        # Check if we should stop profiling
+        elif self._profile_active and not self._profile_finish:
+            self._profile_step_counter += 1
+            if (self._profile_step_counter >= 10 or
+                current_tokens != self._profile_target_tokens):
+                try:
+                    self.worker.profiler.stop()
+                    self._profile_active = False
+                    self._profile_finish = True     # Only run profile once
+                    logger.info(f"Profile stopped successfully on worker rank {self.dp_rank}, profile step: {self._profile_step_counter}")
+                    self._profile_step_counter = 0
+                    # Clean up sync files when profiling is complete
+                    self._cleanup_sync_files()
+                except Exception as e:
+                    logger.warning(f"Failed to stop profiler: {e}")
+
+    def _mark_worker_ready(self) -> None:
+        """Mark this worker as ready for profiling by creating a sync file"""
+        try:
+            os.makedirs(self._profile_sync_dir, exist_ok=True)
+            ready_file = os.path.join(self._profile_sync_dir, f"worker_{self.dp_rank}_ready")
+            with open(ready_file, 'w') as f:
+                f.write(str(time.time()))
+        except Exception as e:
+            logger.warning(f"Failed to mark worker {self.dp_rank} as ready: {e}")
+
+    def _check_all_workers_ready(self) -> bool:
+        """Check if all workers in the data parallel group are ready for profiling"""
+        try:
+            if not os.path.exists(self._profile_sync_dir):
+                return False
+
+            ready_count = 0
+            for rank in range(self.dp_size):
+                ready_file = os.path.join(self._profile_sync_dir, f"worker_{rank}_ready")
+                if os.path.exists(ready_file):
+                    ready_count += 1
+
+            all_ready = ready_count == self.dp_size
+            if all_ready:
+                logger.info(f"All {self.dp_size} workers are ready for profiling")
+            return all_ready
+        except Exception as e:
+            logger.warning(f"Failed to check worker readiness: {e}")
+            return False
+
+    def _cleanup_sync_files(self) -> None:
+        """Clean up synchronization files after profiling is complete"""
+        try:
+            if os.path.exists(self._profile_sync_dir):
+                for filename in os.listdir(self._profile_sync_dir):
+                    if filename.startswith("worker_") and filename.endswith("_ready"):
+                        file_path = os.path.join(self._profile_sync_dir, filename)
+                        os.remove(file_path)
+                # Try to remove the directory if it's empty
+                try:
+                    os.rmdir(self._profile_sync_dir)
+                except OSError:
+                    pass  # Directory not empty or other error, ignore
+        except Exception as e:
+            logger.warning(f"Failed to cleanup sync files: {e}")
 
     def check_batch_sizes_consistency(self) -> None:
         if not dist.is_initialized():
@@ -1610,6 +1713,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     # Return empty ModelRunnerOuptut if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output)
+            
+            # Log final queue status at the end of scheduling step
+            # if os.getenv('VLLM_SCHEDULE_PATH_DEBUG', 'false').lower() == 'true':
+            #     logger.info(f"【调度路径定位】调度step完成 - 本次调度token数: {scheduler_output.total_num_scheduled_tokens}")
+
+            # Brandon Handle profile logic based on token count
+            self._handle_profile_logic(scheduler_output)
+
             (attn_metadata, hidden_states, spec_decode_metadata, positions,
              num_scheduled_tokens, logits_indices, aux_hidden_states,
              num_scheduled_tokens_np, finished_sending,

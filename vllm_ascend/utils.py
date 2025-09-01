@@ -367,6 +367,7 @@ def dispose_tensor(x: torch.Tensor):
     x.set_(torch.empty((0, ), device=x.device, dtype=x.dtype))
 
 
+
 class ProfileExecuteDuration:
     _instance = None
     _observations: List[Tuple[str, Event, Event]] = []
@@ -449,6 +450,15 @@ def get_rm_router_logits_state(ep_size: int, dp_size: int,
 # When all_reduce_merge is in progress, shared_experts does not do all_reduce in mlp, but waits until shared_experts+router_experts are completed before doing all_reduce
 # Currently, all_reduce_merge is enabled by default in the AllGather, AllGatherEP and NaiveMulticast scenarios of the deepseek model.
 def get_all_reduce_merge_state(ep_size: int, is_deepseek_v3_r1: bool):
+    # Brandon TP=1的时候不执行allreduce
+    # Import here to avoid circular dependency
+    from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
+
+    # Only enable all_reduce_merge when TP > 1, since all_reduce is only needed for tensor parallelism
+    tp_size = get_tensor_model_parallel_world_size()
+    if tp_size <= 1:
+        return False
+
     # the fusion operator torch_npu.npu_grouped_matmul_finalize_routing called by allgather ep
     # only supports deepseek v3/r1
     if (envs.VLLM_ENABLE_FUSED_EXPERTS_ALLGATHER_EP and ep_size > 1

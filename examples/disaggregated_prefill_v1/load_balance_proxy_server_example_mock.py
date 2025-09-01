@@ -15,7 +15,14 @@ class ProxyState:
         self.decoder_host = decoder_host
         self.decoder_port = decoder_port
         self.decoder_url = f'http://{decoder_host}:{decoder_port}'
-        self.client = httpx.AsyncClient(timeout=None)
+        # Increase connection pool size for better concurrency
+        self.client = httpx.AsyncClient(
+            timeout=None,
+            limits=httpx.Limits(
+                max_connections=1000,  # Maximum total connections
+                max_keepalive_connections=200  # Maximum keep-alive connections
+            )
+        )
         self.req_id_counter = 0
 
         # Initialize tokenizer
@@ -107,6 +114,8 @@ async def _handle_completions(api: str, request: Request):
 
     # Extract prompt from request
     prompt = req_data.get("prompt", "")
+    # TODO(Brandon): output_length 写死
+    req_data["max_tokens"] = 200
 
     # Generate KV transfer parameters and get truncated prompt
     kv_transfer_params, truncated_prompt = proxy_state.generate_kv_transfer_params(req_data, prompt, request_id)
@@ -133,10 +142,10 @@ async def _handle_completions(api: str, request: Request):
                     if chunk:  # Only yield non-empty chunks
                         chunk_count += 1
                         if chunk_count == 1:
-                            print(f"First chunk received for request {request_id}")
+                            print(f"First chunk received for request {request_id}", flush=True)
                         yield chunk
 
-                print(f"Completed streaming {chunk_count} chunks for request {request_id}")
+                print(f"Completed streaming {chunk_count} chunks for request {request_id}", flush=True)
         except Exception as e:
             logger.error(f"Error streaming from decoder: {e}")
             raise

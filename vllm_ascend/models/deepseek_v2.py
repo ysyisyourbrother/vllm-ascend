@@ -38,16 +38,6 @@ logger = init_logger("vllm")
 if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
     logger.info("【推理路径定位】DeepSeek V2/V3 模型文件已加载 - vllm_ascend.models.deepseek_v2")
 
-# 性能监控功能说明
-if os.getenv('VLLM_ATTENTION_PERF_MONITOR', 'false').lower() == 'true':
-    logger.info("【推理路径定位】Attention性能监控已启用 - 将以日志形式记录所有forward阶段的执行时间数据")
-
-# 全局性能监控计数器
-# 使用方法：设置环境变量 VLLM_ATTENTION_PERF_MONITOR=true 启用性能监控
-# 数据格式：通过vllm logger以特定格式记录性能数据，格式为 [ATTENTION_PERF]|数据内容
-# step表示完整模型前向传播的次数，在CustomDeepseekV2ForCausalLM.forward中递增
-_global_step_counter = 0
-
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.attention import Attention, AttentionMetadata
@@ -93,6 +83,10 @@ from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import dispose_tensor, npu_prefetch
+
+# Global variables for profiler
+_worker_profiler = None
+_profiler_started = False
 
 
 class CustomDeepseekV2SiluAndMul(SiluAndMul):
@@ -607,6 +601,14 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             hidden_states: torch.Tensor,
             kv_cache: Optional[torch.Tensor] = None,
             attn_metadata: Optional[AttentionMetadata] = None) -> torch.Tensor:
+
+        # TODO(Brandon): 启动Attention layer的profiler
+        # Start profiler only once for the first forward call
+        # global _worker_profiler, _profiler_started
+        # if _worker_profiler is not None and not _profiler_started:
+        #     _worker_profiler.start()
+        #     _profiler_started = True
+
         if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
             logger.info(f"【推理路径定位】Attention Layer {self.debug_layer_idx} forward开始 - hidden_states shape: {hidden_states.shape}")
 
@@ -615,22 +617,7 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
                                   and attn_metadata is not None
                                   and not forward_context.with_prefill
                                   and attn_metadata.num_decodes > 0)
-
-        # 性能监控：根据专用环境变量决定是否收集数据
-        perf_monitor_enabled = os.getenv('VLLM_ATTENTION_PERF_MONITOR', 'false').lower() == 'true'
-        if perf_monitor_enabled:
-            # 获取当前step（由模型主forward方法管理）
-            global _global_step_counter
-
-            # 获取DP rank
-            from vllm.distributed.parallel_state import get_dp_group
-            dp_rank = get_dp_group().rank_in_group if get_dp_group().world_size > 1 else 0
-
-            # NPU同步并记录开始时间
-            torch_npu.npu.synchronize()
-            start_time = time.perf_counter()
-
-            logger.info(f"【性能监控】开始性能监控 - Layer {self.debug_layer_idx}, Step {_global_step_counter}, DP Rank {dp_rank}")
+            
         forward_kwargs = {"enable_multistream_mla": enable_multistream_mla}
         if self.q_lora_rank is not None:
             npu_prefetch(self.q_a_proj.weight,
@@ -665,21 +652,11 @@ class CustomDeepseekV2MLAAttention(DeepseekV2MLAAttention):
             if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
                 logger.info(f"【推理路径定位】Attention Layer {self.debug_layer_idx} forward完成 (torchair_graph_enabled = False) - output shape: {output.shape}")
 
-        # 性能监控：记录结束时间并以日志形式记录数据
-        if perf_monitor_enabled:
-            # NPU同步并记录结束时间
-            torch_npu.npu.synchronize()
-            end_time = time.perf_counter()
-            execution_time = (end_time - start_time) * 1000  # 转换为毫秒
-
-            # 直接使用vllm logger记录性能数据，使用特定格式标识
-            perf_message = f"dp_rank={dp_rank}|layer_index={self.debug_layer_idx}|step={_global_step_counter}|execution_time_ms={execution_time:.3f}|timestamp={end_time:.6f}"
-
-            # 使用特定前缀标识性能数据，便于解析脚本识别
-            logger.info(f"[ATTENTION_PERF]|{perf_message}")
-
-            logger.info(f"【性能监控】性能监控完成 - Layer {self.debug_layer_idx}, Step {_global_step_counter}, "
-                       f"执行时间: {execution_time:.3f}ms, DP Rank {dp_rank}")
+        # TODO(Brandon): 启动Attention layer的profiler
+        # Stop profiler after the first forward call completes
+        # if _worker_profiler is not None and _profiler_started:
+        #     _worker_profiler.stop()
+        #     _profiler_started = False
 
         return output
 
@@ -1082,10 +1059,6 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        # 性能监控：在完整模型forward开始时递增step计数器
-        if os.getenv('VLLM_ATTENTION_PERF_MONITOR', 'false').lower() == 'true':
-            global _global_step_counter
-            _global_step_counter += 1
 
         # 添加主模型forward开始日志
         if os.getenv('VLLM_INFERENCE_PATH_DEBUG', 'false').lower() == 'true':
