@@ -144,7 +144,8 @@ class NPUWorker(WorkerBase):
     def init_device(self):
         device = self._init_device()
         # Init ModelRunner here, so that we have access to self.device.
-        self.model_runner = NPUModelRunner(self.vllm_config, device)
+        # 新增，传入worker以获取profiler (非图模式)
+        self.model_runner = NPUModelRunner(self.vllm_config, device, worker=self)
 
     def determine_available_memory(self) -> int:
         # Profile the memory usage of the model and get the maximum number of

@@ -163,7 +163,10 @@ def graph_capture(device: torch.device):
 
 class NPUModelRunner(LoRAModelRunnerMixin):
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device, worker=None):
+        # 新增：传入worker用于获取profiler
+        # 注意图模式和非图模式的worker不同
+        self.worker = worker
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -385,6 +388,51 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+        
+        # 新增功能：用于profile，通过设置 PROFILE_TARGET_TOKENS 开启
+        self._profile_target_tokens = int(os.getenv('PROFILE_TARGET_TOKENS', '0'))
+        self._profile_active = False
+        self._profile_finish = False
+        self._profile_step_counter = 0
+
+    # 新增功能：用于profile，通过设置 PROFILE_TARGET_TOKENS 开启
+    # 测量范围为一批调度token数达到 PROFILE_TARGET_TOKENS 后的连续五个step
+    # 用于测量高负载情况下的算子性能
+    def _handle_profile_logic(self, scheduler_output) -> None:
+        """Handle profile start/stop logic based on token count"""
+        # Skip if PROFILE_TARGET_TOKENS is not set or invalid
+        if self._profile_target_tokens <= 0:
+            return
+        # Skip if worker or profiler is not available
+        if not self.worker or not self.worker.profiler:
+            return
+
+        current_tokens = scheduler_output.total_num_scheduled_tokens
+
+        # Check if we should start profiling
+        if not self._profile_active and current_tokens == self._profile_target_tokens and not self._profile_finish:
+            try:
+                self.worker.profiler.start()
+                self._profile_active = True
+                self._profile_step_counter = 0
+                logger.info("Profile started successfully")
+            except Exception as e:
+                logger.warning(f"Failed to start profiler: {e}")
+
+        # Check if we should stop profiling
+        elif self._profile_active and not self._profile_finish:
+            self._profile_step_counter += 1
+            if (self._profile_step_counter >= 5 or
+                current_tokens != self._profile_target_tokens):
+                try:
+                    self.worker.profiler.stop()
+                    self._profile_active = False
+                    self._profile_finish = True     # 只运行一次profile
+                    self._profile_step_counter = 0
+                    logger.info("Profile stopped successfully")
+                except Exception as e:
+                    logger.warning(f"Failed to stop profiler: {e}")
+
 
     def check_batch_sizes_consistency(self) -> None:
         if not dist.is_initialized():
@@ -1610,6 +1658,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     # Return empty ModelRunnerOuptut if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output)
+
+            # 新增功能：用于profile，通过设置 PROFILE_TARGET_TOKENS 开启
+            self._handle_profile_logic(scheduler_output)
+            
             (attn_metadata, hidden_states, spec_decode_metadata, positions,
              num_scheduled_tokens, logits_indices, aux_hidden_states,
              num_scheduled_tokens_np, finished_sending,

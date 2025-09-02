@@ -25,5 +25,6 @@ from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 class NPUTorchairModelRunner(NPUModelRunner):
 
-    def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        super().__init__(vllm_config, device)
+    def __init__(self, vllm_config: VllmConfig, device: torch.device, worker=None):
+        # 新增，传入worker以获取profiler
+        super().__init__(vllm_config, device, worker=worker)
